@@ -14,7 +14,7 @@ Below is a concise overview of the conference program.
 
 > **[Cluster: Practitioners’ Summit](https://cluster-practitioners-summit.github.io/)** is a dedicated practitioners’ summit for people who build, ship, and defend visualizations for a living. View the [full summit schedule below](#cluster-practitioners-summit).
 
-> **[VISions: Forward-Thinking Provocations](/year/2026/info/call-participation/visions/)**. A single-track event for forward thinking ideas to inspire the broad visualization community. Stay tuned for [presenter and talk information below](#visions).
+> **[VISions: Forward-Thinking Provocations](/year/2026/info/invited-speakers/visions/)**. A single-track event for forward thinking ideas to inspire the broad visualization community. [Featured talks by Zhu-Tian Chen and Ana Crisan](#visions).
 
 <hr/>
 
@@ -133,7 +133,9 @@ _1:00 PM - 2:30 PM (EST)_<br/>
 A venue for forward-thinking ideas to inspire the broad visualization community (including both researchers and practitioners).
 
 _3:00 PM - 4:15 PM (EST)_<br/>
-**VISion Talks** with Q & A Discussion<br />
+**VISions** with Q & A Discussion<br />
+**[Will Visualization Help Humans Act on Data or Help AI Act on Humans?](/year/2026/info/invited-speakers/visions/#zhu-tian-chen-will-visualization-help-humans-act-on-data-or-help-ai-act-on-humans)** by Zhu-Tian Chen<br />
+**[Ways of Thinking, Ways of Doing, and the Future of Visualization Research](/year/2026/info/invited-speakers/visions/#ana-crisan-ways-of-thinking-ways-of-doing-and-the-future-of-visualization-research)** by Ana Crisan<br />
 
 #### Evening
 
