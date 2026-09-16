@@ -5,16 +5,26 @@
  * It reads from either of two sources, which deliver the same shaped thread
  * (`bluesky/types.ts`):
  *
- *   - `atUri` reads the thread straight from the public Bluesky AppView. This
- *     is what pages use once the real post URIs are known and baked in.
  *   - `paperId` reads it from the conference discussion service, which
  *     addresses threads by the paper's stable id, reaches readers behind
  *     networks that cannot see Bluesky, and is the only source that accepts
  *     guest writes.
+ *   - `atUri` reads the thread straight from the public Bluesky AppView. This
+ *     is what pages use once the real post URIs are known and baked in.
  *
- * Given both, the AppView is tried first and the service is the fallback.
+ * Given both, the service is tried first and the AppView is the fallback: only
+ * the service has the full moderation state, and only it takes writes.
+ *
  * Commenting and liking appear only when the thread came from the service and
  * the reader's site session yields a token; everything else is read-only.
+ *
+ * A reader can remove their own comments. That deletes the post from Bluesky as
+ * well as taking it off this page and cannot be undone, so the control confirms
+ * before it acts — and says that the conference keeps its own record either way,
+ * since removing is not a way to take back something harmful. Only comments
+ * written through this page can be removed here: a reply the reader wrote from
+ * their own Bluesky account lives in their repository, not in the shared one, so
+ * it is marked as theirs but is theirs to delete on Bluesky.
  *
  * A comment carries the attendee's real name unless they tick "Hide my name",
  * which swaps it for their stable pseudonym. Such a post is unnamed rather than
@@ -26,7 +36,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, FormEvent } from "react";
 import PostCard from "./bluesky/PostCard";
-import type { PostLikeContext } from "./bluesky/PostCard";
+import type { PostLikeContext, PostOwnContext } from "./bluesky/PostCard";
 import ReplyList from "./bluesky/ReplyList";
 import SortToggle from "./bluesky/SortToggle";
 import { fetchAppViewThread } from "./bluesky/direct";
@@ -34,6 +44,8 @@ import { formatOpensAt, likeCountOf } from "./bluesky/format";
 import { createServiceClient } from "./bluesky/service";
 import type {
   MeResponse,
+  MyComment,
+  MyCommentsResponse,
   MyLikesResponse,
   ServiceClient,
 } from "./bluesky/service";
@@ -73,6 +85,8 @@ interface BlueskyDiscussionProps {
 interface LoadedThread {
   source: ThreadSource;
   thread: ThreadResponse;
+  /** Bypassed the service's shared cache, which may still disagree. */
+  bypassedCache: boolean;
 }
 
 interface GuestToken {
@@ -105,7 +119,7 @@ function truncateByline(name: string): string {
     : name;
 }
 
-/** Top-level ordering. "top" = most liked first (recency as tie-break);
+/** Top-level ordering. "top" = most liked first (oldest first as tie-break);
  *  "newest" = most recent first. Nested replies stay chronological.
  *
  *  The optimistic like `deltas` fold into the sort key as well as the count, so
@@ -121,9 +135,24 @@ function sortReplies(
     likeCountOf(post) + (deltas.get(post.uri) ?? 0);
   const byRecency = (a: ShapedPost, b: ShapedPost) =>
     (b.createdAt ?? "").localeCompare(a.createdAt ?? "");
+  const byAge = (a: ShapedPost, b: ShapedPost) =>
+    (a.createdAt ?? "").localeCompare(b.createdAt ?? "");
   const byLikes = (a: ShapedPost, b: ShapedPost) =>
-    likesOf(b) - likesOf(a) || byRecency(a, b);
+    likesOf(b) - likesOf(a) || byAge(a, b);
   return [...replies].sort(sort === "top" ? byLikes : byRecency);
+}
+
+/** Pending (just-posted) replies sort in on recency; under "top" they have no
+ *  likes yet, so they are pinned at the end instead of being buried. */
+function orderReplies(
+  replies: ShapedPost[],
+  pending: ShapedPost[],
+  sort: ReplySort,
+  deltas: Map<string, number>,
+): ShapedPost[] {
+  return sort === "newest"
+    ? sortReplies([...replies, ...pending], sort, deltas)
+    : [...sortReplies(replies, sort, deltas), ...pending];
 }
 
 /** Every reply URI in a thread, at any depth. */
@@ -140,6 +169,24 @@ function collectUris(
     }
   }
   return into;
+}
+
+/**
+ * A reply list minus the given URIs and everything under them — the same reach
+ * removing a comment has, applied locally between the click and the poll that
+ * stops returning it.
+ */
+function dropUris(replies: ShapedPost[], uris: Set<string>): ShapedPost[] {
+  if (uris.size === 0) {
+    return replies;
+  }
+  return replies
+    .filter((reply) => !uris.has(reply.uri))
+    .map((reply) =>
+      reply.replies?.length
+        ? { ...reply, replies: dropUris(reply.replies, uris) }
+        : reply,
+    );
 }
 
 /** The server's merged like count for every post in a thread, keyed by URI. */
@@ -345,6 +392,15 @@ export default function BlueskyDiscussion({
   const [submitting, setSubmitting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [pendingReplies, setPendingReplies] = useState<ShapedPost[]>([]);
+  // Which comments in this thread are the reader's own. The thread response is
+  // shared between readers and cannot say, so it comes from the per-user
+  // endpoint — and it is what puts the remove control on their posts only.
+  const [myComments, setMyComments] = useState<MyComment[]>([]);
+  // Comments removed in this session, applied over the thread until a poll stops
+  // returning them; put back if the removal turns out to have failed.
+  const [removedLocally, setRemovedLocally] = useState<Set<string>>(
+    () => new Set(),
+  );
   // Which posts *this reader* has liked, and — while an optimistic toggle is in
   // flight — a per-post adjustment laid over the server's total. The thread
   // response is shared between readers (nginx-cached) and so cannot carry either.
@@ -367,7 +423,10 @@ export default function BlueskyDiscussion({
   }, [likedUris]);
   const [refreshing, setRefreshing] = useState(false);
 
-  const { hasToken, getToken } = useGuestToken(Boolean(paperId));
+  // Also minted for an AppView-only thread: it buys no writes there, but it is
+  // what tells us the reader's own Bluesky handle, and so which replies in a
+  // read-only thread are theirs.
+  const { hasToken, getToken } = useGuestToken(Boolean(paperId || atUri));
 
   // Callers pass an inline array literal, so depend on its contents rather than
   // its identity — otherwise every render would build a new client and restart
@@ -383,35 +442,39 @@ export default function BlueskyDiscussion({
   const attribution = anonymous
     ? identity?.pseudonym
     : identity?.name || identity?.pseudonym;
-  // A reader who has linked a Bluesky account can post and like there directly,
-  // so we hide the guest composer for them and point them at the thread instead.
+  // A reader who has linked a Bluesky account is invited to reply there under
+  // their own name; the composer and the like button stay open to them either way.
   const blueskyHandle = identity?.bluesky?.trim() || null;
   const hasBlueskyAccount = Boolean(blueskyHandle);
 
   const load = useCallback(
-    async (signal: AbortSignal, fresh: boolean): Promise<LoadedThread> => {
-      if (atUri) {
+    async (signal: AbortSignal, uncached: boolean): Promise<LoadedThread> => {
+      if (paperId) {
         try {
-          const thread = await fetchAppViewThread(atUri, { signal });
-          // Unreachable from here (blocked network) or not there at all: with a
-          // paper id the service can still answer, so let it try.
-          if (thread.state !== "unavailable" || !paperId) {
-            return { source: "direct", thread };
+          const thread = await client.fetchThread(paperId, {
+            signal,
+            fresh: uncached,
+          });
+          // Down, or holding no thread for this paper: with a post URI the
+          // AppView can still show it, so let it try.
+          if (thread.state !== "unavailable" || !atUri) {
+            return { source: "service", thread, bypassedCache: uncached };
           }
         } catch (err) {
-          if ((err as Error).name === "AbortError" || !paperId) {
+          if ((err as Error).name === "AbortError" || !atUri) {
             throw err;
           }
         }
       }
 
-      if (!paperId) {
+      if (!atUri) {
         throw new Error("No Bluesky post URI or paper id was given.");
       }
 
       return {
-        source: "service",
-        thread: await client.fetchThread(paperId, { signal, fresh }),
+        source: "direct",
+        thread: await fetchAppViewThread(atUri, { signal }),
+        bypassedCache: false,
       };
     },
     [atUri, client, paperId],
@@ -442,7 +505,7 @@ export default function BlueskyDiscussion({
     markInteraction();
     setRefreshing(true);
     try {
-      await refresh(true);
+      await refresh({ force: true });
     } finally {
       setRefreshing(false);
     }
@@ -478,18 +541,63 @@ export default function BlueskyDiscussion({
     }
   }, [client, getToken, paperId]);
 
+  /**
+   * The reader's own comments in this thread, which is what marks their posts in
+   * the thread so the remove control can go on them.
+   *
+   * Unlike the likes this is not re-read on every poll: it only changes when the
+   * reader posts or removes something, and both do it themselves.
+   */
+  const syncMyComments = useCallback(async () => {
+    const token = paperId ? await getToken() : null;
+    if (!token || !paperId) {
+      return;
+    }
+
+    try {
+      const response = await client.fetchMyComments(paperId, token);
+      if (!response.ok) {
+        return;
+      }
+
+      const body = (await response.json()) as MyCommentsResponse;
+      if (Array.isArray(body.comments)) {
+        setMyComments(body.comments);
+      }
+    } catch {
+      // Without the list the reader just gets no remove control; the thread
+      // reads the same. Never surface this over the discussion itself.
+    }
+  }, [client, getToken, paperId]);
+
+  // Read once the guest UI is live. The list only changes when the reader posts
+  // or removes something, and both re-read it themselves, so it stays off the
+  // polling path.
+  useEffect(() => {
+    if (interactive) {
+      void syncMyComments();
+    }
+  }, [interactive, syncMyComments]);
+
   useEffect(() => {
     if (!data || data.thread.state !== "open") {
       return;
     }
 
+    // Only a response the shared cache could also have served may retire
+    // optimistic state. A cache-bypassing read runs ahead of that cache, so
+    // retiring on one lets the next ordinary poll undo what the reader just did.
+    const cacheHasCaughtUp = !data.bypassedCache;
+
     // Drop optimistic replies only once they appear in the real thread — a
     // cached response may not include them yet, and clearing on every poll
     // would make a just-posted comment flicker out and back.
     const known = collectUris(data.thread.post?.replies || []);
-    setPendingReplies((current) =>
-      current.filter((reply) => !reply.uri || !known.has(reply.uri)),
-    );
+    if (cacheHasCaughtUp) {
+      setPendingReplies((current) =>
+        current.filter((reply) => !reply.uri || !known.has(reply.uri)),
+      );
+    }
 
     // Record the server's own counts, both so a new toggle can capture its
     // baseline and so pending deltas can be reconciled against them.
@@ -502,7 +610,7 @@ export default function BlueskyDiscussion({
     // past the baseline it was toggled against — a cached poll returning the
     // pre-like count leaves the delta in place, so the count never drops back.
     setLikeDeltas((current) => {
-      if (!current.size) {
+      if (!current.size || !cacheHasCaughtUp) {
         return current;
       }
       let changed = false;
@@ -601,7 +709,8 @@ export default function BlueskyDiscussion({
         ]);
         setDraft("");
 
-        await refresh(true);
+        await refresh({ force: true, uncached: true });
+        await syncMyComments();
       } catch (err) {
         setActionError(
           (err as Error).message || "Your comment could not be posted.",
@@ -619,6 +728,7 @@ export default function BlueskyDiscussion({
       paperId,
       refresh,
       submitting,
+      syncMyComments,
     ],
   );
 
@@ -683,7 +793,7 @@ export default function BlueskyDiscussion({
           throw new Error(`The service returned ${response.status}.`);
         }
 
-        await refresh(true);
+        await refresh({ force: true, uncached: true });
       } catch (err) {
         rollBack();
         setActionError(
@@ -692,6 +802,65 @@ export default function BlueskyDiscussion({
       }
     },
     [client, getToken, paperId, refresh],
+  );
+
+  /**
+   * Remove one of the reader's own comments.
+   *
+   * The comment leaves the rendered thread straight away and comes back if the
+   * write fails. Nothing here can undo a removal that succeeded: the service
+   * deletes the post from Bluesky, and the confirmation in the control is the
+   * only step between the reader and that.
+   */
+  const removeOwnComment = useCallback(
+    async (postUri: string) => {
+      markInteraction();
+      setActionError(null);
+
+      const applyLocally = (removed: boolean) => {
+        setRemovedLocally((current) => {
+          const updated = new Set(current);
+          if (removed) {
+            updated.add(postUri);
+          } else {
+            updated.delete(postUri);
+          }
+          return updated;
+        });
+        setMyComments((current) =>
+          current.map((comment) =>
+            comment.postUri === postUri ? { ...comment, removed } : comment,
+          ),
+        );
+      };
+
+      applyLocally(true);
+
+      try {
+        const token = paperId ? await getToken() : null;
+        if (!token || !paperId) {
+          applyLocally(false);
+          setActionError(
+            "Your session expired. Reload the page and try again.",
+          );
+          return;
+        }
+
+        const response = await client.removeComment(paperId, token, postUri);
+        if (!response.ok) {
+          throw new Error(`The service returned ${response.status}.`);
+        }
+
+        await refresh({ force: true, uncached: true });
+        await syncMyComments();
+      } catch (err) {
+        applyLocally(false);
+        setActionError(
+          (err as Error).message || "Your comment could not be removed.",
+        );
+      }
+    },
+    [client, getToken, markInteraction, paperId, refresh, syncMyComments],
   );
 
   // ── render ──
@@ -718,8 +887,8 @@ export default function BlueskyDiscussion({
         <h2 style={{ marginBottom: "0.5rem" }}>Discussion</h2>
         <p style={{ color: "#6b7280", margin: 0 }}>
           {opensAt
-            ? `The discussion for this paper opens shortly before its session, on ${opensAt}.`
-            : "The discussion for this paper opens shortly before its session."}
+            ? `The discussion opens shortly before the session, on ${opensAt}.`
+            : "The discussion opens shortly before the session."}
         </p>
       </section>
     );
@@ -738,12 +907,21 @@ export default function BlueskyDiscussion({
     likeBaselinesRef.current,
     serverCounts,
   );
-  // Pending (just-posted) replies stay pinned at the end regardless of sort so
-  // the author always sees their own comment.
-  const replies = [
-    ...sortReplies(root?.replies || [], sort, activeDeltas),
-    ...pendingReplies,
-  ];
+  // A pending reply is held until the cache agrees, so hide the copy whenever
+  // the thread on screen already carries it. Guest comments always land at the
+  // top level (the service takes no parent), so this only scans that level —
+  // and does nothing at all in the usual case of no pending replies. A comment
+  // the reader has just removed is dropped from both lists until the service
+  // stops returning it.
+  const shown = dropUris(root?.replies || [], removedLocally);
+  const replies = orderReplies(
+    shown,
+    dropUris(pendingReplies, removedLocally).filter(
+      (reply) => !reply.uri || !shown.some((post) => post.uri === reply.uri),
+    ),
+    sort,
+    activeDeltas,
+  );
   const remaining = COMMENT_LIMIT - graphemeLength(draft);
   // The two possible bylines the submit button can show — the real name and the
   // pseudonym — so it can reserve room for the wider and not resize (shoving the
@@ -757,11 +935,38 @@ export default function BlueskyDiscussion({
   // The like control is the same on the root and every reply; the discussion
   // owns the state so they all read and update one shared source.
   const likeContext: PostLikeContext = {
-    canLike: interactive && !hasBlueskyAccount,
+    canLike: interactive,
     likedUris,
     deltas: activeDeltas,
     onToggle: toggleLike,
   };
+
+  // Which posts are marked "(me)": the guest comments they wrote through this
+  // page, and — when they have linked an account — the replies they wrote on
+  // Bluesky themselves. Only the first kind can be removed from here; the second
+  // is theirs to delete on Bluesky, where the post's own timestamp links.
+  //
+  // Marking does not need the service. A thread read straight from the AppView
+  // carries no guest attribution at all (every post comes back `guest: false`
+  // with no pseudonym), but it does carry author handles, so the reader's own
+  // Bluesky replies are still theirs to recognise. Removing does need it, hence
+  // `canRemove`.
+  const ownUris = new Set(
+    myComments
+      .filter((comment) => !comment.removed)
+      .map((comment) => comment.postUri),
+  );
+  const ownContext: PostOwnContext | undefined =
+    identity || ownUris.size > 0
+      ? {
+          ownUris,
+          handle: blueskyHandle
+            ? blueskyHandle.replace(/^@/, "").toLowerCase()
+            : null,
+          canRemove: interactive,
+          onRemove: (postUri) => void removeOwnComment(postUri),
+        }
+      : undefined;
 
   return (
     <section
@@ -784,7 +989,13 @@ export default function BlueskyDiscussion({
 
       {root && (
         <div style={announcementCardStyle}>
-          <PostCard bare like={likeContext} post={root} variant="root" />
+          <PostCard
+            bare
+            like={likeContext}
+            own={ownContext}
+            post={root}
+            variant="root"
+          />
 
           {root.bskyUrl && (
             <a
@@ -794,11 +1005,20 @@ export default function BlueskyDiscussion({
               style={calloutFooterStyle}
               target="_blank"
             >
-              <span>
-                {hasBlueskyAccount
-                  ? `🦋 You're on Bluesky as @${blueskyHandle} — post and like directly there`
-                  : "🦋 View or join this discussion on Bluesky"}
-              </span>
+              {hasBlueskyAccount ? (
+                <span style={calloutNudgeStyle}>
+                  <span>
+                    🦋 You're on Bluesky as @{blueskyHandle} — reply there if
+                    you like
+                  </span>
+                  <span style={calloutNudgeReasonStyle}>
+                    Your reply then appears under your own account instead of
+                    the shared bridge account.
+                  </span>
+                </span>
+              ) : (
+                <span>🦋 View or join this discussion on Bluesky</span>
+              )}
               <span aria-hidden="true" style={{ fontSize: "1.1rem" }}>
                 →
               </span>
@@ -807,7 +1027,7 @@ export default function BlueskyDiscussion({
         </div>
       )}
 
-      {interactive && !hasBlueskyAccount && (
+      {interactive && (
         <form onSubmit={submitComment} style={{ margin: "1rem 0" }}>
           <label
             htmlFor={`bsky-comment-${paperId}`}
@@ -1031,7 +1251,12 @@ export default function BlueskyDiscussion({
         </div>
       </div>
 
-      <ReplyList like={likeContext} maxDepth={maxDepth} replies={replies} />
+      <ReplyList
+        like={likeContext}
+        maxDepth={maxDepth}
+        own={ownContext}
+        replies={replies}
+      />
     </section>
   );
 }
@@ -1068,4 +1293,17 @@ const calloutFooterStyle: CSSProperties = {
   fontWeight: 600,
   fontSize: "0.9rem",
   textDecoration: "none",
+};
+
+/** The linked-account invitation, stacked over its quieter reason line. */
+const calloutNudgeStyle: CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: "0.15rem",
+};
+
+const calloutNudgeReasonStyle: CSSProperties = {
+  fontWeight: 400,
+  fontSize: "0.82rem",
+  color: "#1e40af",
 };
